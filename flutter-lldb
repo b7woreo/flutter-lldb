@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+
+def _get_adb_command(args):
+    if args.adb is None:
+        adb_path = os.path.join(os.environ.get('ANDROID_HOME'), "platform-tools", "adb")
+    else:
+        adb_path = args.adb
+
+    adb_command = [adb_path]
+    if args.device is not None:
+        adb_command.extend(['-s', args.device])
+
+    return adb_command
+
+def _find_package_pid(adb_command, package):
+    ps_output = subprocess.check_output(adb_command + ['shell', 'ps'],
+                                        encoding='utf-8')
+    ps_match = re.search('^\S+\s+(\d+).*\s%s' % package, ps_output, re.MULTILINE)
+    if not ps_match:
+        print('Unable to find pid for package %s on device' % package)
+        return None
+    return int(ps_match.group(1))
+
+
+def _get_device_abi(adb_command):
+    abi_output = subprocess.check_output(
+        adb_command + ['shell', 'getprop', 'ro.product.cpu.abi'],
+        encoding='utf-8').strip()
+    if abi_output.startswith('arm64'):
+        return 'arm64'
+    if abi_output.startswith('arm'):
+        return 'arm'
+    print('Unknown abi: %s' % abi_output)
+    return None
+
+
+def _print_vscode_config(args, package_pid):
+    vscode_config = """
+    {
+        "version": "0.2.0",
+        "configurations": [
+            {
+                "name": "flutter-lldb",
+                "type": "lldb",
+                "request": "attach",
+                "pid": "%s",
+                "initCommands": [
+                    "platform select remote-android",
+                    "platform connect unix-abstract-connect:///data/data/%s/debug.socket"
+                ],
+                "postRunCommands": [
+                    "target symbols add %s"
+                ]
+            }
+        ]
+    }
+    """ % (
+      package_pid, args.package, os.path.join(args.local_engine_src, 'out', args.local_engine, 'libflutter.so')
+    )
+    print("Visual Studio Code launch.json:\n%s" % vscode_config)
+
+
+def _run_lldb(args):
+    adb_command = _get_adb_command(args)
+    if adb_command is None:
+        return 1
+
+    package_pid = _find_package_pid(adb_command, args.package)
+    if package_pid is None:
+        return 1
+    
+    abi = _get_device_abi(adb_command)
+    if abi is None:
+        return 1
+
+    lldb_local_path = os.path.join(os.path.dirname(__file__), 'lldb-server', abi, 'lldb-server')
+    lldb_device_tmp_path = '/data/local/tmp/lldb-server'
+    lldb_device_path = '/data/data/%s/lldb-server' % args.package
+    subprocess.check_call(adb_command + ['push', lldb_local_path, lldb_device_tmp_path])
+    subprocess.check_call(adb_command + ['shell', 'run-as', args.package, 'sh', '-c', "'cp -F %s %s'" % (lldb_device_tmp_path, lldb_device_path)])
+
+    subprocess.call(adb_command+ ['shell', 'run-as', args.package, 'killall', 'lldb-server'])
+
+    _print_vscode_config(args, package_pid)
+
+    try:
+        subprocess.check_call(adb_command + ['shell', 'run-as', args.package, 'sh', '-c', "'%s platform --server --listen unix-abstract:///data/data/%s/debug.socket'" % (lldb_device_path, args.package)])
+    except KeyboardInterrupt:
+        pass
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Flutter debugger tool')
+    parser.add_argument('--adb', type=str, help='path to ADB tool')
+    parser.add_argument('--device', type=str, help='serial number of the target device')
+    parser.add_argument('--local-engine-src',required=True, type=str)
+    parser.add_argument('--local-engine',required=True, type=str)
+    parser.add_argument('package', type=str)
+
+    args = parser.parse_args()
+    _run_lldb(args)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
